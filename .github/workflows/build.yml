@@ -1,0 +1,173 @@
+name: Build CelShading (AML)
+
+# Build otomatis plugin AML untuk dua ABI:
+#   armeabi-v7a  -> GTA SA 2.00 (32-bit)
+#   arm64-v8a    -> GTA SA 2.10 (64-bit)
+#
+# Cara pakai:
+#   * Push ke branch main/master, atau jalankan manual lewat tab Actions ("Run workflow").
+#   * Hasil: artifact "CelShading-AML" di halaman run (zip berisi kedua .so + contoh INI).
+#   * Rilis otomatis: buat tag, mis.  git tag v1.0.0 && git push origin v1.0.0
+#     -> zip juga dipublikasikan di halaman Releases.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Android NDK r27c. Dipasang lewat sdkmanager kalau belum ada di runner.
+  NDK_VERSION: 27.2.12479018
+
+jobs:
+  build:
+    name: Build (armeabi-v7a + arm64-v8a)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Siapkan Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          NDK="$SDK/ndk/$NDK_VERSION"
+          if [ ! -d "$NDK" ]; then
+            echo "NDK $NDK_VERSION belum ada, memasang..."
+            SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+            yes | "$SDKMANAGER" --licenses >/dev/null || true
+            "$SDKMANAGER" --install "ndk;$NDK_VERSION" >/dev/null
+          fi
+          test -x "$NDK/ndk-build" || { echo "::error::ndk-build tidak ditemukan di $NDK"; exit 1; }
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "Memakai NDK di $NDK"
+
+      - name: Build dengan ndk-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_NDK_HOME/ndk-build" \
+            NDK_PROJECT_PATH="$PWD" \
+            APP_BUILD_SCRIPT="$PWD/Android.mk" \
+            NDK_APPLICATION_MK="$PWD/Application.mk" \
+            NDK_DEBUG=0 \
+            -j"$(nproc)"
+
+      - name: Periksa hasil build
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for abi in armeabi-v7a arm64-v8a; do
+            so="libs/$abi/libCelShading.so"
+            test -f "$so" || { echo "::error::$so tidak dihasilkan"; exit 1; }
+            echo "=== $abi  ($(stat -c%s "$so") bytes)"
+            "$BIN/llvm-readelf" -h "$so" | grep -E "Class:|Machine:"
+            echo "-- pustaka yang dibutuhkan:"
+            "$BIN/llvm-readelf" -d "$so" | grep NEEDED
+
+            # AML mencari kedua simbol ini lewat dlsym; wajib terekspor.
+            n=$("$BIN/llvm-nm" -D --defined-only "$so" | grep -cE ' (OnModLoad|__GetModInfo)$' || true)
+            if [ "$n" != "2" ]; then
+              echo "::error::$abi: OnModLoad/__GetModInfo tidak terekspor (ketemu $n dari 2)"
+              exit 1
+            fi
+            # c++_static: tidak boleh bergantung pada libc++_shared.so
+            if "$BIN/llvm-readelf" -d "$so" | grep -q "libc++_shared"; then
+              echo "::error::$abi: bergantung pada libc++_shared.so"
+              exit 1
+            fi
+            echo "-- alignment segmen LOAD (16 KB = 0x4000):"
+            "$BIN/llvm-readelf" -lW "$so" | awk '$1=="LOAD"{print "   " $NF}' | sort -u
+          done
+
+      - name: Kemas
+        shell: bash
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = "tag" ]; then VER="$REF_NAME"; else VER="dev-${GITHUB_SHA::7}"; fi
+          PKG="dist/CelShading-AML"
+          mkdir -p "$PKG/armeabi-v7a" "$PKG/arm64-v8a"
+          cp libs/armeabi-v7a/libCelShading.so "$PKG/armeabi-v7a/"
+          cp libs/arm64-v8a/libCelShading.so   "$PKG/arm64-v8a/"
+          cp config/CelShading.ini "$PKG/"
+          cp README.md LICENSE "$PKG/"
+          cp -r docs "$PKG/"
+          cat > "$PKG/BACA-DULU.txt" <<EOF
+          CelShading AML  -  $VER
+
+          Salin SATU file .so ke folder mods game:
+            /sdcard/Android/data/com.rockstargames.gtasa/mods/
+
+            GTA SA 2.00 (32-bit)  ->  armeabi-v7a/libCelShading.so
+            GTA SA 2.10 (64-bit)  ->  arm64-v8a/libCelShading.so
+
+          Jangan salin keduanya sekaligus. Jalankan game satu kali; berkas
+          pengaturan CelShading.ini otomatis dibuat di folder "configs" milik AML
+          (lokasi persisnya tertulis di logcat, tag CelShading). Edit lalu simpan:
+          perubahan langsung berlaku tanpa restart game.
+          Detail lengkap ada di README.md.
+          EOF
+          {
+            echo "### CelShading AML $VER"
+            echo
+            echo '| Berkas | Ukuran | SHA-256 |'
+            echo '|---|---|---|'
+            for f in "$PKG"/armeabi-v7a/libCelShading.so "$PKG"/arm64-v8a/libCelShading.so; do
+              echo "| \`${f#$PKG/}\` | $(stat -c%s "$f") B | \`$(sha256sum "$f" | cut -d' ' -f1)\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Unggah artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: CelShading-AML
+          path: dist/CelShading-AML
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publikasikan rilis
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Unduh artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: CelShading-AML
+          path: pkg
+
+      - name: Buat zip dan GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ZIP="CelShading-AML-$TAG.zip"
+          (cd pkg && zip -r -q "../$ZIP" .)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ZIP" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "$ZIP" --repo "$GITHUB_REPOSITORY" \
+              --title "CelShading AML $TAG" --generate-notes
+          fi

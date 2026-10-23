@@ -1,0 +1,10 @@
+# keluaran ndk-build
+libs/
+obj/
+# paket hasil kemas lokal
+dist/
+# keluaran tes di PC
+tests/build/
+*.o
+*.a
+.DS_Store
